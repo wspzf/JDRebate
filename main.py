@@ -16,7 +16,7 @@ class JDRebate(PluginBase):
     """京东商品转链返利插件"""
     description = "京东商品转链返利插件 - 自动识别京东链接并生成带返利的推广链接"
     author = "wspzf"
-    version = "1.0.0"
+    version = "1.1.0"
 
     def __init__(self):
         super().__init__()
@@ -35,6 +35,7 @@ class JDRebate(PluginBase):
             self.allowed_groups = basic_config.get("allowed_groups", [])  # 允许的群组列表
             self.signurl = basic_config.get("signurl", "5")  # signurl参数，5返回更详细信息
             self.chain_type = basic_config.get("chain_type", "2")  # chainType参数，2返回短链接
+            self.show_commission = basic_config.get("show_commission", True)  # 是否显示返利金额
             
             # 修复正则表达式，使用非捕获组确保返回完整链接
             self.jd_link_pattern = r"https?://[^\s<>]*(?:3\.cn|jd\.|jingxi|u\.jd\.com)[^\s<>]+"
@@ -47,6 +48,7 @@ class JDRebate(PluginBase):
             logger.success(f"京东商品转链返利插件配置加载成功")
             logger.info(f"允许的群组列表: {self.allowed_groups}")
             logger.info(f"京东链接匹配模式: {self.jd_link_pattern}")
+            logger.info(f"是否显示返利金额: {self.show_commission}")
         except Exception as e:
             logger.error(f"加载京东商品转链返利插件配置失败: {str(e)}")
             self.enable = False  # 配置加载失败，禁用插件
@@ -77,11 +79,11 @@ class JDRebate(PluginBase):
         if not self.enable:
             logger.debug("京东转链插件未启用")
             return True  # 插件未启用，允许后续插件处理
-
+        
         # 获取消息内容
         content = message.get("Content", "")
         from_user = message.get("FromWxid", "")
-
+        
         logger.debug(f"京东转链插件收到XML消息")
         
         # 检查消息来源是否在允许的范围内
@@ -97,35 +99,66 @@ class JDRebate(PluginBase):
             if appmsg is None:
                 logger.debug("非商品分享XML消息，跳过处理")
                 return True
-                
-            # 获取商品标题和链接
-            title_elem = appmsg.find("title")
+            
+            # 获取消息类型
+            type_elem = appmsg.find("type")
+            msg_type = type_elem.text if type_elem is not None else None
+            logger.debug(f"解析到的 XML 类型: {msg_type}")
+            
+            # 提取商品信息的方法，根据不同类型采用不同的提取策略
+            url = None
+            sku = None
+            
+            # 提取URL路径
             url_elem = appmsg.find("url")
+            if url_elem is not None:
+                url = url_elem.text
             
-            if title_elem is None or url_elem is None:
-                logger.debug("无法从XML中提取标题或链接，跳过处理")
-                return True
+            # 情况1: 常规URL分享
+            if url and ("item.jd.com" in url or "item.m.jd.com" in url):
+                logger.debug(f"从URL中提取京东商品链接: {url}")
+                # 去除URL中的参数部分(问号后面的内容)
+                url = self._clean_url(url)
                 
-            title = title_elem.text
-            url = url_elem.text
+            # 情况2: 京东小程序分享 (type 33)
+            elif msg_type == "33" or msg_type == "36":
+                logger.debug(f"检测到京东小程序分享，类型: {msg_type}")
+                # 尝试从pagepath中提取SKU
+                weappinfo = appmsg.find("weappinfo")
+                if weappinfo is not None:
+                    pagepath = weappinfo.find("pagepath")
+                    if pagepath is not None and pagepath.text:
+                        pagepath_text = pagepath.text
+                        logger.debug(f"解析到小程序路径: {pagepath_text}")
+                        
+                        # 提取SKU
+                        sku_match = re.search(r'sku=(\d+)', pagepath_text)
+                        if sku_match:
+                            sku = sku_match.group(1)
+                            logger.debug(f"从小程序路径中提取到SKU: {sku}")
+                            # 构建标准京东商品链接
+                            url = f"https://item.jd.com/{sku}.html"
+                            logger.debug(f"构建标准京东链接: {url}")
+                        else:
+                            logger.debug(f"无法从路径中提取SKU: {pagepath_text}")
+                    else:
+                        logger.debug("未找到pagepath元素或pagepath为空")
+                else:
+                    logger.debug("未找到weappinfo元素")
             
-            # 去除URL中的参数部分(问号后面的内容)
-            url = self._clean_url(url)
-            
-            # 检查是否是京东链接
-            if not self._is_jd_link(url):
-                logger.debug(f"非京东链接: {url}")
-                return True
+            # 检查是否成功提取到有效京东链接
+            if url and self._is_jd_link(url):
+                logger.info(f"从XML消息中提取到京东商品链接: {url}")
                 
-            logger.info(f"从XML消息中提取到京东商品链接: {url}")
-            
-            # 转换链接
-            converted_content = await self.convert_link(url)
-            if converted_content:
-                # 直接发送转链结果，不再添加原始标题
-                await bot.send_text_message(from_user, converted_content)
-                logger.success(f"成功发送XML转链文案到 {from_user}")
-                return False  # 阻止后续插件处理
+                # 转换链接
+                converted_content = await self.convert_link(url)
+                if converted_content:
+                    # 直接发送转链结果
+                    await bot.send_text_message(from_user, converted_content)
+                    logger.success(f"成功发送XML转链文案到 {from_user}")
+                    return False  # 阻止后续插件处理
+            else:
+                logger.debug(f"未能提取有效的京东链接或非京东链接")
                 
         except Exception as e:
             logger.error(f"处理XML消息时出错: {str(e)}")
@@ -266,59 +299,59 @@ class JDRebate(PluginBase):
                     except Exception as e:
                         logger.error(f"解析API响应失败: {str(e)}")
                         return None
+            
+            # 检查返回结果
+            if "status" not in result or result["status"] != 200 or "content" not in result or not result["content"]:
+                logger.warning("API返回无效结果")
+                return None
+            
+            # 获取第一个商品信息
+            content_items = result["content"]
+            if not content_items:
+                logger.warning("API返回的商品列表为空")
+                return None
                 
-                # 检查返回结果
-                if "status" not in result or result["status"] != 200 or "content" not in result or not result["content"]:
-                    logger.warning("API返回无效结果")
-                    return None
-                
-                # 获取第一个商品信息
-                content_items = result["content"]
-                if not content_items:
-                    logger.warning("API返回的商品列表为空")
-                    return None
-                    
-                item = content_items[0]
-                
-                # 提取商品信息
-                title = item.get("title", "")
-                original_price = item.get("size", "")  # 原价
-                quanhou_jiage = item.get("quanhou_jiage", "")  # 券后价
-                coupon_info = item.get("coupon_info", "")  # 优惠券描述
-                coupon_amount = item.get("coupon_info_money", "")  # 优惠券金额
-                commission = item.get("tkfee3", "")  # 佣金金额
-                shorturl = item.get("shorturl", "")  # 短链接
-                
-                logger.debug(f"商品信息提取成功: 标题={title}, 价格={quanhou_jiage}, 短链接={shorturl}")
-                
-                if not shorturl:
-                    logger.warning("API返回结果中无短链接")
-                    return None
-                
-                # 构建简化版的转链文案
-                formatted_content = f"📌 {title}\n"
-                
-                # 添加价格信息
-                if original_price and quanhou_jiage and original_price != quanhou_jiage:
-                    formatted_content += f"💰 原价: ¥{original_price} 券后价: ¥{quanhou_jiage}\n"
-                elif quanhou_jiage:
-                    formatted_content += f"💰 价格: ¥{quanhou_jiage}\n"
-                
-                # 添加优惠券信息
-                if coupon_info:
-                    formatted_content += f"🎁 优惠: {coupon_info}\n"
-                elif coupon_amount and coupon_amount != "0":
-                    formatted_content += f"🎁 优惠券: ¥{coupon_amount}\n"
-                
-                # 添加佣金信息
-                if commission and commission != "0":
-                    formatted_content += f"💸 返利: ¥{commission}\n"
-                
-                # 添加购买链接
-                formatted_content += f"👉 购买链接: {shorturl}"
-                
-                return formatted_content
-                
+            item = content_items[0]
+            
+            # 提取商品信息
+            title = item.get("title", "")
+            original_price = item.get("size", "")  # 原价
+            quanhou_jiage = item.get("quanhou_jiage", "")  # 券后价
+            coupon_info = item.get("coupon_info", "")  # 优惠券描述
+            coupon_amount = item.get("coupon_info_money", "")  # 优惠券金额
+            commission = item.get("tkfee3", "")  # 佣金金额
+            shorturl = item.get("shorturl", "")  # 短链接
+            
+            logger.debug(f"商品信息提取成功: 标题={title}, 价格={quanhou_jiage}, 短链接={shorturl}")
+            
+            if not shorturl:
+                logger.warning("API返回结果中无短链接")
+                return None
+            
+            # 构建简化版的转链文案
+            formatted_content = f"📌 {title}\n"
+            
+            # 添加价格信息
+            if original_price and quanhou_jiage and original_price != quanhou_jiage:
+                formatted_content += f"💰 原价: ¥{original_price} 券后价: ¥{quanhou_jiage}\n"
+            elif quanhou_jiage:
+                formatted_content += f"💰 价格: ¥{quanhou_jiage}\n"
+            
+            # 添加优惠券信息
+            if coupon_info:
+                formatted_content += f"🎁 优惠: {coupon_info}\n"
+            elif coupon_amount and coupon_amount != "0":
+                formatted_content += f"🎁 优惠券: ¥{coupon_amount}\n"
+            
+            # 添加佣金信息
+            if commission and commission != "0" and self.show_commission:
+                formatted_content += f"💸 返利: ¥{commission}\n"
+            
+            # 添加购买链接
+            formatted_content += f"👉 购买链接: {shorturl}"
+            
+            return formatted_content
+            
         except Exception as e:
             logger.error(f"转链过程中发生错误: {str(e)}")
             return None
