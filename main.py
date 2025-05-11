@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import aiohttp
 import tomllib
 import xml.etree.ElementTree as ET
@@ -16,7 +17,7 @@ class JDRebate(PluginBase):
     """京东商品转链返利插件"""
     description = "京东商品转链返利插件 - 自动识别京东链接并生成带返利的推广链接"
     author = "wspzf"
-    version = "1.1.0"
+    version = "1.2.0"
 
     def __init__(self):
         super().__init__()
@@ -32,7 +33,8 @@ class JDRebate(PluginBase):
             self.enable = basic_config.get("enable", False)  # 是否启用插件
             self.appkey = basic_config.get("appkey", "")  # 折京客appkey
             self.union_id = basic_config.get("union_id", "")  # 联盟ID
-            self.allowed_groups = basic_config.get("allowed_groups", [])  # 允许的群组列表
+            self.group_mode = basic_config.get("group_mode", "all")  # 新增：群组控制模式，默认为 "all"
+            self.group_list = basic_config.get("group_list", [])  # 新增：群组/用户列表
             self.signurl = basic_config.get("signurl", "5")  # signurl参数，5返回更详细信息
             self.chain_type = basic_config.get("chain_type", "2")  # chainType参数，2返回短链接
             self.show_commission = basic_config.get("show_commission", True)  # 是否显示返利金额
@@ -43,10 +45,11 @@ class JDRebate(PluginBase):
             # 编译正则表达式
             self.jd_link_regex = re.compile(self.jd_link_pattern)
             
-            self.api_url = basic_config.get("api_url", "")  # API接口地址
+            self.api_url = "http://api.zhetaoke.com:20000/api/open_jing_union_open_promotion_byunionid_get.ashx" # 直接写入 api_url
 
             logger.success(f"京东商品转链返利插件配置加载成功")
-            logger.info(f"允许的群组列表: {self.allowed_groups}")
+            logger.info(f"群组控制模式: {self.group_mode}")
+            logger.info(f"群组/用户列表: {self.group_list}")
             logger.info(f"京东链接匹配模式: {self.jd_link_pattern}")
             logger.info(f"是否显示返利金额: {self.show_commission}")
         except Exception as e:
@@ -167,15 +170,28 @@ class JDRebate(PluginBase):
         
     async def _check_allowed_source(self, from_user: str) -> bool:
         """检查消息来源是否在允许的范围内"""
-        # 检查是否是群消息
+        # 检查消息来源是否为私聊或群聊
         is_group_message = from_user.endswith("@chatroom")
         
-        # 如果是群消息，检查是否在允许的群组列表中
-        if is_group_message and self.allowed_groups and from_user not in self.allowed_groups:
-            logger.debug(f"群组 {from_user} 不在允许列表中，不处理")
-            return False
+        if self.group_mode == "all":
+            logger.debug(f"群组控制模式为 'all'，允许来自 {from_user} 的消息")
+            return True
+        elif self.group_mode == "whitelist":
+            if from_user in self.group_list:
+                logger.debug(f"群组控制模式为 'whitelist'，{from_user} 在白名单中，允许处理")
+                return True
+            else:
+                logger.debug(f"群组控制模式为 'whitelist'，{from_user} 不在白名单中，不处理")
+                return False
+        elif self.group_mode == "blacklist":
+            if from_user in self.group_list:
+                logger.debug(f"群组控制模式为 'blacklist'，{from_user} 在黑名单中，不处理")
+                return False
+            else:
+                logger.debug(f"群组控制模式为 'blacklist'，{from_user} 不在黑名单中，允许处理")
+                return True
         else:
-            logger.debug(f"消息来源 {from_user} 允许处理")
+            logger.warning(f"未知的群组控制模式: {self.group_mode}，默认允许所有来源")
             return True
     
     def _is_jd_link(self, url: str) -> bool:
@@ -259,11 +275,85 @@ class JDRebate(PluginBase):
                 
         return True  # 允许后续插件处理
     
+    async def _parse_api_response(self, api_json_result: dict) -> Optional[Dict[str, Any]]:
+        """
+        Parses the API JSON response, attempting to handle two known structures.
+        Returns a dictionary with extracted data or None if parsing fails or data is invalid.
+        """
+        try:
+            # Attempt to parse Structure 1 (nested, e.g., jd_union_open_promotion_byunionid_get_response)
+            if "jd_union_open_promotion_byunionid_get_response" in api_json_result:
+                response_data = api_json_result.get("jd_union_open_promotion_byunionid_get_response", {})
+                outer_code = response_data.get("code")
+                if outer_code == "0": #京东联盟外层code，0表示成功
+                    result_str = response_data.get("result")
+                    if result_str and isinstance(result_str, str):
+                        try:
+                            inner_result = json.loads(result_str) # 'result' is a JSON string
+                            inner_code = inner_result.get("code") # 折京客内层code
+                            if inner_code == 200: # 200表示成功
+                                data_payload = inner_result.get("data", {})
+                                if data_payload and isinstance(data_payload, dict) :
+                                    short_url = data_payload.get("shortURL")
+                                    click_url = data_payload.get("clickURL") # clickURL is also in this structure
+                                    if short_url:
+                                        return {
+                                            "shorturl": short_url,
+                                            "clickURL": click_url, # Capture clickURL if present
+                                            "_is_minimal": True # Indicates less detailed data
+                                        }
+                                    else:
+                                        logger.warning("API (Structure 1) did not return shortURL in data payload.")
+                                else:
+                                    logger.warning(f"API (Structure 1) 'data' payload is missing or not a dict. Inner result: {inner_result}")
+                            else:
+                                logger.warning(f"API (Structure 1) inner code: {inner_code}, message: {inner_result.get('message')}. RequestId: {inner_result.get('requestId')}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"API (Structure 1) failed to parse inner JSON 'result': {e}. Result string: '{result_str[:200]}...'")
+                    else:
+                        logger.warning(f"API (Structure 1) 'result' string not found or not a string. Response data: {str(response_data)[:200]}")
+                else:
+                    logger.warning(f"API (Structure 1) outer_code: {outer_code}. Full response: {str(response_data)[:500]}")
+                return None # Failed to process structure 1 correctly or outer_code indicated error
+
+            # Attempt to parse Structure 2 (flat, with "status" and "content")
+            elif "status" in api_json_result and api_json_result.get("status") == 200:
+                content_items = api_json_result.get("content")
+                if content_items and isinstance(content_items, list) and len(content_items) > 0:
+                    item = content_items[0]
+                    # This structure typically contains full details
+                    return {
+                        "title": item.get("title", ""),
+                        "original_price": item.get("size", ""),
+                        "quanhou_jiage": item.get("quanhou_jiage", ""),
+                        "coupon_info": item.get("coupon_info", ""),
+                        "coupon_amount": item.get("coupon_info_money", ""),
+                        "commission": item.get("tkfee3", ""),
+                        "shorturl": item.get("shorturl", ""),
+                        "coupon_click_url": item.get("coupon_click_url", ""),
+                        "item_url": item.get("item_url", ""),
+                        "_is_minimal": False
+                    }
+                else:
+                    # Handle cases like {"status":200,"message":"succ","data":null,"cid":"xxxxx"}
+                    if api_json_result.get("data") is None and api_json_result.get("message"):
+                        logger.warning(f"API (Structure 2 like) 'content' was empty or invalid, message: {api_json_result.get('message')}")
+                    else:
+                        logger.warning("API (Structure 2) 'content' is empty or not a list.")
+            
+            # If neither structure matched or a non-200 status for structure 2
+            else:
+                logger.warning(f"API response did not match known structures or indicated an error. Status: {api_json_result.get('status')}. Raw: {str(api_json_result)[:500]}")
+
+        except Exception as e:
+            logger.error(f"Unexpected error during API response parsing: {e}. Raw response: {str(api_json_result)[:500]}")
+        
+        return None
+    
     async def convert_link(self, link: str) -> Optional[str]:
         """使用折京客API转换链接，返回转链后的完整文案"""
         try:
-            logger.debug(f"开始转换链接: {link}")
-            # URL编码链接
+            logger.debug(f"开始转换链接 (convert_link): {link}")
             encoded_link = urllib.parse.quote(link)
             
             async with aiohttp.ClientSession() as session:
@@ -274,93 +364,77 @@ class JDRebate(PluginBase):
                     "chainType": self.chain_type,
                     "signurl": self.signurl
                 }
-                
-                logger.debug(f"请求参数: {params}")
-                
-                # 添加请求头
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Type": "application/x-www-form-urlencoded", # Keep as is, GET uses params in URL
                     "Accept": "application/json"
                 }
-                
-                # 发送GET请求
+                logger.debug(f"请求参数 (convert_link): {params}")
                 async with session.get(self.api_url, params=params, headers=headers) as response:
                     if response.status != 200:
-                        logger.error(f"转链API请求失败: {response.status}")
+                        logger.error(f"转链API请求失败 (convert_link): {response.status}, Response: {await response.text()}")
                         return None
-                        
-                    # 尝试读取响应内容
                     try:
                         text = await response.text()
-                        import json
-                        result = json.loads(text)
-                        logger.debug(f"API返回结果: {result}")
-                    except Exception as e:
-                        logger.error(f"解析API响应失败: {str(e)}")
+                        api_json_result = json.loads(text) # Parse the JSON text
+                        logger.debug(f"API返回原始结果 (convert_link): {str(api_json_result)[:1000]}") # Log raw for debug
+                    except json.JSONDecodeError as e:
+                        logger.error(f"解析API响应JSON失败 (convert_link): {e}. Response text: {text[:500]}")
                         return None
             
-            # 检查返回结果
-            if "status" not in result or result["status"] != 200 or "content" not in result or not result["content"]:
-                logger.warning("API返回无效结果")
+            parsed_data = await self._parse_api_response(api_json_result)
+
+            if not parsed_data:
+                logger.warning("convert_link: _parse_api_response returned None.")
                 return None
-            
-            # 获取第一个商品信息
-            content_items = result["content"]
-            if not content_items:
-                logger.warning("API返回的商品列表为空")
-                return None
-                
-            item = content_items[0]
-            
-            # 提取商品信息
-            title = item.get("title", "")
-            original_price = item.get("size", "")  # 原价
-            quanhou_jiage = item.get("quanhou_jiage", "")  # 券后价
-            coupon_info = item.get("coupon_info", "")  # 优惠券描述
-            coupon_amount = item.get("coupon_info_money", "")  # 优惠券金额
-            commission = item.get("tkfee3", "")  # 佣金金额
-            shorturl = item.get("shorturl", "")  # 短链接
-            
-            logger.debug(f"商品信息提取成功: 标题={title}, 价格={quanhou_jiage}, 短链接={shorturl}")
-            
+
+            shorturl = parsed_data.get("shorturl")
             if not shorturl:
-                logger.warning("API返回结果中无短链接")
+                logger.warning("convert_link: Parsed API data does not contain a short URL.")
                 return None
+
+            if parsed_data.get("_is_minimal"):
+                logger.info(f"API for '{link}' returned minimal data. Sending simplified message with URL: {shorturl}")
+                return f"📌 京东推广链接\n👉 {shorturl}"
+
+            # Build the rich message using data from parsed_data
+            title = parsed_data.get("title", "京东商品") # Default title if empty
+            original_price = parsed_data.get("original_price", "")
+            quanhou_jiage = parsed_data.get("quanhou_jiage", "")
+            coupon_info = parsed_data.get("coupon_info", "")
+            coupon_amount = parsed_data.get("coupon_amount", "")
+            commission = parsed_data.get("commission", "")
             
-            # 构建简化版的转链文案
-            formatted_content = f"📌 {title}\n"
+            formatted_content = f"📌 {title or '京东商品'}\n" # Ensure title is not empty
             
-            # 添加价格信息
-            if original_price and quanhou_jiage and original_price != quanhou_jiage:
-                formatted_content += f"💰 原价: ¥{original_price} 券后价: ¥{quanhou_jiage}\n"
-            elif quanhou_jiage:
-                formatted_content += f"💰 价格: ¥{quanhou_jiage}\n"
-            
-            # 添加优惠券信息
+            if quanhou_jiage: # Primary price to show
+                price_info = f"💰 价格: ¥{quanhou_jiage}"
+                if original_price and original_price != quanhou_jiage:
+                    price_info = f"💰 原价: ¥{original_price} 券后: ¥{quanhou_jiage}"
+                formatted_content += f"{price_info}\n"
+            elif original_price: # Fallback if only original price
+                 formatted_content += f"💰 价格: ¥{original_price}\n"
+
             if coupon_info:
                 formatted_content += f"🎁 优惠: {coupon_info}\n"
             elif coupon_amount and coupon_amount != "0":
                 formatted_content += f"🎁 优惠券: ¥{coupon_amount}\n"
             
-            # 添加佣金信息
-            if commission and commission != "0" and self.show_commission:
+            if self.show_commission and commission and commission != "0":
                 formatted_content += f"💸 返利: ¥{commission}\n"
             
-            # 添加购买链接
             formatted_content += f"👉 购买链接: {shorturl}"
             
             return formatted_content
             
         except Exception as e:
-            logger.error(f"转链过程中发生错误: {str(e)}")
+            logger.error(f"转链过程中发生错误 (convert_link for {link}): {str(e)}")
             return None
     
     async def convert_link_official(self, link: str) -> Optional[str]:
-        """使用折京客API转换链接，只返回短链接"""
+        """使用折京客API转换链接，只返回短链接或最优先的可用链接"""
         try:
-            logger.debug(f"开始转换链接(官方): {link}")
-            # URL编码链接
+            logger.debug(f"开始转换链接 (official): {link}")
             encoded_link = urllib.parse.quote(link)
             
             async with aiohttp.ClientSession() as session:
@@ -371,60 +445,48 @@ class JDRebate(PluginBase):
                     "chainType": self.chain_type,
                     "signurl": self.signurl
                 }
-                
-                logger.debug(f"请求参数: {params}")
-                
-                # 添加请求头
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded",
                     "Accept": "application/json"
                 }
-                
-                # 发送GET请求
+                logger.debug(f"请求参数 (official): {params}")
                 async with session.get(self.api_url, params=params, headers=headers) as response:
                     if response.status != 200:
-                        logger.error(f"转链API请求失败: {response.status}")
+                        logger.error(f"转链API请求失败 (official): {response.status}, Response: {await response.text()}")
                         return None
-                        
-                    # 尝试读取响应内容
                     try:
                         text = await response.text()
-                        import json
-                        result = json.loads(text)
-                    except Exception as e:
-                        logger.error(f"解析API响应失败: {str(e)}")
+                        api_json_result = json.loads(text)
+                        logger.debug(f"API返回原始结果 (official): {str(api_json_result)[:1000]}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"解析API响应JSON失败 (official): {e}. Response text: {text[:500]}")
                         return None
                 
-                # 检查返回结果
-                if "status" not in result or result["status"] != 200 or "content" not in result or not result["content"]:
-                    logger.warning("API返回无效结果")
-                    return None
-                
-                # 获取第一个商品信息
-                content_items = result["content"]
-                if not content_items:
-                    logger.warning("API返回的商品列表为空")
-                    return None
-                    
-                item = content_items[0]
-                
-                # 依次尝试获取短链接、优惠券链接、商品链接
-                shorturl = item.get("shorturl", "")
-                if shorturl:
-                    return shorturl
-                
-                coupon_click_url = item.get("coupon_click_url", "")
-                if coupon_click_url:
-                    return coupon_click_url
-                
-                item_url = item.get("item_url", "")
-                if item_url:
-                    return item_url
-                
-                logger.warning("API返回结果中无有效链接")
+            parsed_data = await self._parse_api_response(api_json_result)
+
+            if not parsed_data:
+                logger.warning("convert_link_official: _parse_api_response returned None.")
+                return None
+
+            # Priority: shorturl, then clickURL (from minimal), then coupon_click_url/item_url (from full)
+            if parsed_data.get("shorturl"):
+                return parsed_data.get("shorturl")
+            
+            if parsed_data.get("_is_minimal") and parsed_data.get("clickURL"):
+                logger.debug("convert_link_official: Using clickURL as fallback for minimal response.")
+                return parsed_data.get("clickURL")
+            
+            if not parsed_data.get("_is_minimal"): # Rich data structure
+                if parsed_data.get("coupon_click_url"):
+                    logger.debug("convert_link_official: Using coupon_click_url as fallback.")
+                    return parsed_data.get("coupon_click_url")
+                if parsed_data.get("item_url"):
+                    logger.debug("convert_link_official: Using item_url as fallback.")
+                    return parsed_data.get("item_url")
+            
+            logger.warning(f"convert_link_official: Parsed API data for {link} did not contain any usable URL.")
             return None
                 
         except Exception as e:
-            logger.error(f"转链过程中发生错误: {str(e)}")
+            logger.error(f"转链过程中发生错误 (official for {link}): {str(e)}")
             return None 
